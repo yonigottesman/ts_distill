@@ -24,6 +24,7 @@ from monai.transforms import (
     Compose,
     CropForegroundd,
     EnsureChannelFirstd,
+    EnsureTyped,
     Lambda,
     LoadImaged,
     Orientationd,
@@ -34,11 +35,6 @@ from monai.transforms import (
     ScaleIntensityRanged,
     Spacingd,
 )
-
-
-def collate_fn(batch):
-    batch = list_data_collate(batch)
-    return batch["image"], batch["label"]
 
 
 def get_btcv_data_loaders(
@@ -54,6 +50,7 @@ def get_btcv_data_loaders(
             CropForegroundd(keys=["image", "label"], source_key="image"),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
+            EnsureTyped(keys=["image", "label"], device=get_device(), track_meta=False),
             RandCropByPosNegLabeld(
                 keys=["image", "label"],
                 label_key="label",
@@ -84,6 +81,7 @@ def get_btcv_data_loaders(
                 pixdim=(1.5, 1.5, 2.0),
                 mode=("bilinear", "nearest"),
             ),
+            EnsureTyped(keys=["image", "label"], device=get_device(), track_meta=True),
             Lambda(lambda d: (d["image"], d["label"])),
         ]
     )
@@ -178,7 +176,6 @@ class MonaiDiceMetricKeras(keras.metrics.Metric):
         self.m.reset()
 
     def update_state(self, y_true, y_preds, sample_weight=None):
-        y_true, y_preds = y_true.to("cpu"), y_preds.to("cpu")
         y_true_list = decollate_batch(y_true)
         y_true_convert = [self.post_label(val_label_tensor) for val_label_tensor in y_true_list]
         y_preds_list = decollate_batch(y_preds)
