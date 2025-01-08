@@ -60,4 +60,9 @@ if __name__ == "__main__":
             m = m * i
             masks.append(m)
         mask = np.sum(masks, axis=0)
-        nib.Nifti1Image(mask, np.eye(4)).to_filename(labels_folder / f"{nii_file.name.replace('img','label')}")
+
+        # Load the original NIfTI file to get the header and affine
+        original_nii = nib.load(nii_file)
+        new_nii = nib.Nifti1Image(mask.astype(np.int32), original_nii.affine, original_nii.header)
+        new_nii.header.set_data_dtype(np.int32)
+        new_nii.to_filename(labels_folder / f"{nii_file.name.replace('img','label')}")
