@@ -9,7 +9,7 @@ Training is done with [monai](https://github.com/Project-MONAI/MONAI) wrapped in
 
 ### Create weak labels:
 ```bash
-python create_weak_labels.py --data_dir RawData/Training/img --output_dir weak_labels/labels
+python create_weak_labels.py RawData/Training/img weak_labels/
 ```
 ### Training:
 

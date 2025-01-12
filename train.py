@@ -1,6 +1,8 @@
 import argparse
 import os
 
+from tqdm.auto import tqdm
+
 import wandb
 
 os.environ["KERAS_BACKEND"] = "torch"
@@ -9,21 +11,48 @@ from pathlib import Path
 
 import keras
 import torch
-from keras.layers import TorchModuleWrapper
 from keras.src.backend.torch.core import get_device
 from keras.src.trainers.data_adapters import data_adapter_utils
-from monai.data import (CacheDataset, ThreadDataLoader, decollate_batch,
-                        set_track_meta)
+from monai.data import decollate_batch
 from monai.data.utils import list_data_collate
 from monai.inferers import sliding_window_inference
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric
 from monai.networks.nets import SwinUNETR
-from monai.transforms import (AsDiscrete, Compose, CropForegroundd,
-                              EnsureChannelFirstd, EnsureTyped, Lambda,
-                              LoadImaged, Orientationd, RandCropByPosNegLabeld,
-                              RandFlipd, RandRotate90d, RandShiftIntensityd,
-                              ScaleIntensityRanged, Spacingd)
+from monai.transforms import (
+    AsDiscrete,
+    Compose,
+    CropForegroundd,
+    EnsureChannelFirstd,
+    LoadImaged,
+    Orientationd,
+    RandCropByPosNegLabeld,
+    RandFlipd,
+    RandRotate90d,
+    RandShiftIntensityd,
+    ScaleIntensityRanged,
+    Spacingd,
+)
+
+
+class BTCVDataset(torch.utils.data.Dataset):
+    # BTCV is a small dataset so I load it to memory and cache the deterministic transforms results.
+    # For larger datasets process the data and save to disk.
+
+    def __init__(self, data, deterministic_transform, transform):
+        self.transform = transform
+        self.data = [deterministic_transform(d) for d in tqdm(data, desc="Loading data")]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, index):
+        return self.transform(self.data[index])
+
+
+def collate_fn(batch):
+    batch = list_data_collate(batch)
+    return batch["image"], batch["label"]
 
 
 def get_btcv_data_loaders(
@@ -33,7 +62,7 @@ def get_btcv_data_loaders(
     patch_samples_per_image=4,
     patch_size=(96, 96, 96),
 ):
-    train_transforms = Compose(
+    deterministic_transform = Compose(
         [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"], channel_dim=float("nan")),
@@ -41,7 +70,10 @@ def get_btcv_data_loaders(
             CropForegroundd(keys=["image", "label"], source_key="image"),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")),
-            EnsureTyped(keys=["image", "label"], device=get_device(), track_meta=False),
+        ]
+    )
+    train_transforms = Compose(
+        [
             RandCropByPosNegLabeld(
                 keys=["image", "label"],
                 label_key="label",
@@ -57,23 +89,6 @@ def get_btcv_data_loaders(
             RandFlipd(keys=["image", "label"], spatial_axis=[2], prob=0.10),
             RandRotate90d(keys=["image", "label"], prob=0.10, max_k=3),
             RandShiftIntensityd(keys=["image"], offsets=0.10, prob=0.50),
-            Lambda(lambda d: (d["image"], d["label"])),
-        ]
-    )
-    val_transforms = Compose(
-        [
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"], channel_dim=float("nan")),
-            ScaleIntensityRanged(keys=["image"], a_min=-175, a_max=250, b_min=0.0, b_max=1.0, clip=True),
-            CropForegroundd(keys=["image", "label"], source_key="image"),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
-            Spacingd(
-                keys=["image", "label"],
-                pixdim=(1.5, 1.5, 2.0),
-                mode=("bilinear", "nearest"),
-            ),
-            EnsureTyped(keys=["image", "label"], device=get_device(), track_meta=True),
-            Lambda(lambda d: (d["image"], d["label"])),
         ]
     )
 
@@ -97,19 +112,21 @@ def get_btcv_data_loaders(
         if i.name not in val_names
     ]
 
-    # super specific to BTCV small set. For any other data we cannot cache.
-    train_ds = CacheDataset(
-        data=train_files,
-        transform=train_transforms,
-        cache_num=24,
-        cache_rate=1.0,
-        num_workers=8,
-    )
-    train_loader = ThreadDataLoader(train_ds, num_workers=0, batch_size=1, shuffle=True)
-    val_ds = CacheDataset(data=val_files, transform=val_transforms, cache_num=6, cache_rate=1.0, num_workers=4)
-    val_loader = ThreadDataLoader(val_ds, num_workers=0, batch_size=1)
+    ds_train = BTCVDataset(train_files, deterministic_transform, train_transforms)
+    ds_val = BTCVDataset(val_files, deterministic_transform, Compose([]))
 
-    set_track_meta(False)
+    train_loader = torch.utils.data.DataLoader(
+        ds_train,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        ds_val, batch_size=1, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True
+    )
     return train_loader, val_loader
 
 
@@ -128,6 +145,7 @@ class SlidingWindowValidationModel(keras.models.Model):
 
     def test_step(self, data):
         x, y, sample_weight = data_adapter_utils.unpack_x_y_sample_weight(data)
+        x, y = x.to(get_device()), y.to(get_device())
         y_pred = sliding_window_inference(
             x, self.patch_size, self.sliding_window_batch_size, partial(self, training=False)
         )
@@ -135,6 +153,7 @@ class SlidingWindowValidationModel(keras.models.Model):
 
 
 def get_model(patch_size=(96, 96, 96), pretrained_weights=None):
+    keras.mixed_precision.set_global_policy("mixed_float16")
     model = SwinUNETR(
         img_size=patch_size,
         in_channels=1,
@@ -148,6 +167,8 @@ def get_model(patch_size=(96, 96, 96), pretrained_weights=None):
     inputs = keras.layers.Input(shape=(1, *patch_size))
     x = CustomTorchWrapper(model)(inputs)
     k_model = SlidingWindowValidationModel(patch_size, 4, inputs, x)
+    # bug in TorchModuleWrapper so i have to do this manually https://github.com/keras-team/keras/issues/20726
+    k_model = k_model.half()
     return k_model
 
 
@@ -209,7 +230,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_weights", type=str, help="Path to the pretrained weights .pt file")
 
     args = parser.parse_args()
-
+    torch.backends.cudnn.benchmark = True
     wandb.init(project="ts_distill", name=args.wandb_run_name)
 
     train_dl, val_dl = get_btcv_data_loaders(
@@ -224,7 +245,6 @@ if __name__ == "__main__":
         metrics=[MonaiDiceMetricKeras()],
         run_eagerly=False,
     )
-    torch.backends.cudnn.benchmark = True
 
     model.fit(
         train_dl,
